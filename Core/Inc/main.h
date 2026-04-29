@@ -5,8 +5,8 @@
 
 /* MCP2515 SPI1 wiring */
 #define MCP_SPI_INSTANCE    SPI1
-#define MCP_CS_PORT         GPIOB
-#define MCP_CS_PIN          GPIO_PIN_6
+#define MCP_CS_PORT         GPIOA
+#define MCP_CS_PIN          GPIO_PIN_4   /* PA4 — ZIO CN11; SPI1_NSS AF5, used as software GPIO CS */
 #define MCP_INT_PORT        GPIOC
 #define MCP_INT_PIN         GPIO_PIN_0
 

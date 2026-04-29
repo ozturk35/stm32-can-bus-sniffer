@@ -1,4 +1,5 @@
 #include "mcp2515.h"
+#include "uart_console.h"
 #include <string.h>
 
 /* CNF register values for 8 MHz crystal.
@@ -38,28 +39,55 @@ uint8_t mcp2515_read_reg(mcp2515_t *dev, uint8_t addr)
 void mcp2515_write_reg(mcp2515_t *dev, uint8_t addr, uint8_t val)
 {
     uint8_t tx[3] = { MCP_WRITE, addr, val };
+    uint8_t rx[3] = { 0 };
     cs_low(dev);
-    HAL_SPI_Transmit(dev->hspi, tx, 3, HAL_MAX_DELAY);
+    HAL_SPI_TransmitReceive(dev->hspi, tx, rx, 3, HAL_MAX_DELAY);
     cs_high(dev);
 }
 
 void mcp2515_bit_modify(mcp2515_t *dev, uint8_t addr, uint8_t mask, uint8_t data)
 {
     uint8_t tx[4] = { MCP_BIT_MODIFY, addr, mask, data };
+    uint8_t rx[4] = { 0 };
     cs_low(dev);
-    HAL_SPI_Transmit(dev->hspi, tx, 4, HAL_MAX_DELAY);
+    HAL_SPI_TransmitReceive(dev->hspi, tx, rx, 4, HAL_MAX_DELAY);
     cs_high(dev);
 }
 
 /* ---------- Reset -------------------------------------------------------- */
 
-static void mcp2515_hw_reset(mcp2515_t *dev)
+/* Send SPI RESET and poll until MCP2515 confirms config mode.
+ * Uses TransmitReceive (same as reads) to keep SPI RX buffer clean.
+ * Tight polling immediately after RESET catches the Config window; slow
+ * polling continues up to 150 ms for cold-start crystals. */
+static HAL_StatusTypeDef mcp2515_hw_reset(mcp2515_t *dev)
 {
-    uint8_t cmd = MCP_RESET;
+    uint8_t tx[1] = { MCP_RESET };
+    uint8_t rx[1] = { 0 };
     cs_low(dev);
-    HAL_SPI_Transmit(dev->hspi, &cmd, 1, HAL_MAX_DELAY);
+    HAL_SPI_TransmitReceive(dev->hspi, tx, rx, 1, HAL_MAX_DELAY);
     cs_high(dev);
-    HAL_Delay(10);
+
+    /* Tight poll for first 10 ms — catches config mode within one SPI round-trip */
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < 10) {
+        if ((mcp2515_read_reg(dev, MCP_CANSTAT) & MCP_MODE_MASK) == MCP_MODE_CONFIG) {
+            HAL_Delay(1);
+            if ((mcp2515_read_reg(dev, MCP_CANSTAT) & MCP_MODE_MASK) == MCP_MODE_CONFIG)
+                return HAL_OK;
+        }
+    }
+
+    /* Slow poll for remainder of 150 ms window */
+    while (HAL_GetTick() - t0 < 150) {
+        HAL_Delay(2);
+        if ((mcp2515_read_reg(dev, MCP_CANSTAT) & MCP_MODE_MASK) != MCP_MODE_CONFIG)
+            continue;
+        HAL_Delay(2);
+        if ((mcp2515_read_reg(dev, MCP_CANSTAT) & MCP_MODE_MASK) == MCP_MODE_CONFIG)
+            return HAL_OK;
+    }
+    return HAL_TIMEOUT;
 }
 
 /* ---------- Baud rate helper --------------------------------------------- */
@@ -84,11 +112,14 @@ static void apply_baud(mcp2515_t *dev, const baud_entry_t *e)
 
 HAL_StatusTypeDef mcp2515_init(mcp2515_t *dev)
 {
-    mcp2515_hw_reset(dev);
-
-    uint8_t canstat = mcp2515_read_reg(dev, MCP_CANSTAT);
-    if ((canstat & MCP_MODE_MASK) != MCP_MODE_CONFIG)
+    /* Up to 5 reset attempts — CAN bus noise may cause occasional false timeouts */
+    HAL_StatusTypeDef rst = HAL_TIMEOUT;
+    for (int attempt = 0; attempt < 5 && rst != HAL_OK; attempt++)
+        rst = mcp2515_hw_reset(dev);
+    if (rst != HAL_OK) {
+        uart_writef("FATAL: MCP2515 never reached config mode\r\n");
         return HAL_ERROR;
+    }
 
     /* Configure 250 kbit/s */
     const baud_entry_t *e = find_baud(250);
@@ -98,25 +129,26 @@ HAL_StatusTypeDef mcp2515_init(mcp2515_t *dev)
     /* Verify CNF read-back */
     if (mcp2515_read_reg(dev, MCP_CNF1) != e->cnf1 ||
         mcp2515_read_reg(dev, MCP_CNF2) != e->cnf2 ||
-        mcp2515_read_reg(dev, MCP_CNF3) != e->cnf3)
+        mcp2515_read_reg(dev, MCP_CNF3) != e->cnf3) {
+        uart_writef("FATAL: MCP2515 CNF mismatch -- check VCC (5V module on 3.3V SPI?)\r\n");
         return HAL_ERROR;
+    }
 
     /* Both RX buffers: receive any message (bypass filters) */
     mcp2515_write_reg(dev, MCP_RXB0CTRL, MCP_RXB_RXM_ANY);
-    mcp2515_write_reg(dev, MCP_RXB1CTRL, MCP_RXB_RXM_ANY | 0x04); /* RXB1 rolls over from RXB0 */
+    mcp2515_write_reg(dev, MCP_RXB1CTRL, MCP_RXB_RXM_ANY | 0x04);
 
     /* Enable RX interrupts for both buffers */
     mcp2515_write_reg(dev, MCP_CANINTE, MCP_INT_RX0 | MCP_INT_RX1);
 
-    /* Enter normal mode */
+    /* Enter normal mode — requires 11 recessive bits on RXCAN from CAN transceiver */
     mcp2515_write_reg(dev, MCP_CANCTRL, MCP_MODE_NORMAL);
-
-    /* Poll for mode transition (needs 11 recessive bits on bus — ~44 µs at 250k) */
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         HAL_Delay(1);
         if ((mcp2515_read_reg(dev, MCP_CANSTAT) & MCP_MODE_MASK) == MCP_MODE_NORMAL)
             return HAL_OK;
     }
+    uart_writef("FATAL: MCP2515 normal mode timeout -- check CAN transceiver and bus\r\n");
     return HAL_TIMEOUT;
 }
 

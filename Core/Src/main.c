@@ -1,5 +1,3 @@
-#include <stdio.h>
-#include <string.h>
 #include "main.h"
 #include "mcp2515.h"
 #include "ring_buffer.h"
@@ -11,6 +9,11 @@
 mcp2515_t        g_mcp;
 ring_buf_t       g_ring;
 SPI_HandleTypeDef hspi1;
+
+/* Defined in uart_console.c */
+extern volatile int      g_state;
+extern volatile uint32_t g_frames_captured;
+extern volatile uint32_t g_frames_dropped;
 
 /* ---------- Clock: 180 MHz from HSE 8 MHz -------------------------------- */
 
@@ -44,12 +47,13 @@ void SystemClock_Config(void)
 
 static void gpio_init(void)
 {
+    __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
     GPIO_InitTypeDef g = {0};
 
-    /* PB6 — MCP2515 CS (output, start high) */
+    /* PA4 — MCP2515 CS (output, start high) */
     g.Pin   = MCP_CS_PIN;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
     g.Pull  = GPIO_NOPULL;
@@ -97,7 +101,7 @@ static void spi1_init(void)
     hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;    /* CPOL=0 */
     hspi1.Init.CLKPhase          = SPI_PHASE_1EDGE;     /* CPHA=0 */
     hspi1.Init.NSS               = SPI_NSS_SOFT;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16; /* 90/16 ≈ 5.6 MHz */
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128; /* 90/128 ≈ 703 kHz — noise-tolerant */
     hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
     hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
@@ -126,13 +130,17 @@ int main(void)
     uart_console_init();
     ring_buf_init(&g_ring);
 
+    /* Wait for MCP2515 crystal oscillator to stabilise from power-on.
+     * Some crystals take >100 ms to reach steady-state amplitude. */
+    HAL_Delay(200);
+
     /* MCP2515 init */
     g_mcp.hspi     = &hspi1;
     g_mcp.cs_port  = MCP_CS_PORT;
     g_mcp.cs_pin   = MCP_CS_PIN;
 
     if (mcp2515_init(&g_mcp) != HAL_OK)
-        fatal("MCP2515 init failed -- check SPI wiring and VCC=3.3V");
+        fatal("MCP2515 init failed");
 
     /* Boot banner */
     uint8_t canstat = mcp2515_read_reg(&g_mcp, MCP_CANSTAT);
@@ -146,6 +154,26 @@ int main(void)
     /* Main loop */
     for (;;) {
         uart_process_input();
+
+        /* Polling fallback: read MCP2515 RX directly in case INT wire is
+         * not connected or EXTI0 missed an edge (supplements ISR path). */
+        if (g_state == 1) {
+            uint8_t intf = mcp2515_read_reg(&g_mcp, MCP_CANINTF);
+            while (intf & (MCP_INT_RX0 | MCP_INT_RX1)) {
+                can_rx_frame_t pf;
+                pf.timestamp_ms = HAL_GetTick();
+                mcp2515_read_frame(&g_mcp, &pf);
+                uint32_t next = (g_ring.head + 1) & (RING_BUF_SIZE - 1);
+                if (next != g_ring.tail) {
+                    g_ring.buf[g_ring.head] = pf;
+                    g_ring.head = next;
+                    g_frames_captured++;
+                } else {
+                    g_frames_dropped++;
+                }
+                intf = mcp2515_read_reg(&g_mcp, MCP_CANINTF);
+            }
+        }
 
         /* Drain ring buffer and print decoded frames */
         can_rx_frame_t f;
