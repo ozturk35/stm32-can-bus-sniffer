@@ -9,3 +9,4 @@ build/
 *.su
 *.iex
 .DS_Store
+build/
