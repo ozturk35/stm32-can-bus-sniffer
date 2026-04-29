@@ -1,9 +1,9 @@
 # STM32 CAN Bus Sniffer — Functional Specification Document (FSD)
 
-**Version:** 1.0  
-**Date:** 2026-04-29  
+**Version:** 1.1  
+**Date:** 2026-04-30  
 **Platform:** STM32 Nucleo F446ZE (SLOT4)  
-**Status:** Draft
+**Status:** Phase 2 Complete
 
 ---
 
@@ -45,7 +45,7 @@ Verifying a CAN traffic generator (the companion ESP32-S3 node from Wish 01b) re
 CAN Bus (250 kbit/s, J1939)
         │
         ▼
-  MCP2515 SPI CAN Controller (SPI1, CS=PB6, INT=PC0)
+  MCP2515 SPI CAN Controller (SPI1, CS=PA4, INT=PC0)
         │
    EXTI0 interrupt on PC0 (falling edge)
         │
@@ -113,7 +113,7 @@ In IDLE state, MCP2515 RX interrupts are disabled. Incoming frames are not captu
 | SCK | PA5 | SPI1_SCK | Arduino CN7 D13 |
 | SI (MOSI) | PA7 | SPI1_MOSI | Arduino CN7 D11 |
 | SO (MISO) | PA6 | SPI1_MISO | Arduino CN7 D12 |
-| CS | PB6 | GPIO output | Arduino CN10 D10; active-low; driven by firmware |
+| CS | PA4 | GPIO output | ZIO CN11; active-low; driven by firmware (SPI1_NSS AF5 not used — software CS) |
 | INT | PC0 | EXTI0 input | Arduino CN9 A5; active-low; falling-edge interrupt |
 
 #### CAN Bus Topology
@@ -157,8 +157,8 @@ Drivers/STM32F4xx_HAL_Driver/   — STM32 HAL (from STM32CubeF4 package)
 
 1. `HAL_Init()`: SysTick for 1 ms HAL timebase; NVIC priority grouping.
 2. System clock: 180 MHz from HSE + PLL (STM32F446ZE maximum).
-3. GPIO init: PB6 as output (CS, driven high); PC0 as input (EXTI0, falling-edge, pull-up enabled).
-4. SPI1 init: Master, CPOL=0/CPHA=0, 8-bit, prescaler for ~5.6 MHz (APB2 90 MHz ÷ 16).
+3. GPIO init: PA4 as output (CS, driven high); PC0 as input (EXTI0, falling-edge, pull-up enabled).
+4. SPI1 init: Master, CPOL=0/CPHA=0, 8-bit, prescaler 128 → ~703 kHz (APB2 90 MHz ÷ 128). Conservative rate chosen for noise tolerance on short bench wiring.
 5. USART3 init: 115200, 8N1 (PD8 TX, PD9 RX via ST-Link VCP).
 6. Ring buffer init: 256 entries, head = tail = 0.
 7. MCP2515 driver init: reset → read CANSTAT (expect 0x80) → write CNF1/CNF2/CNF3 for 250 kbit/s → read-back verify → configure RXB0/RXB1 → write acceptance mask (pass-all default) → set normal mode → enable RX0IE + RX1IE in CANINTE.
@@ -308,7 +308,7 @@ Drivers/STM32F4xx_HAL_Driver/   — STM32 HAL (from STM32CubeF4 package)
 | NFR-1.1 | Must | The firmware shall sustain reception of all CAN frames at 250 kbit/s with 8-byte payloads under generator burst mode (theoretical maximum ~3125 frames/sec at 100% bus load) without ring buffer overflow. |
 | NFR-1.2 | Must | The EXTI0 ISR shall complete its SPI frame read and ring buffer write within one CAN frame time at 250 kbit/s with 8 bytes (~320 µs) so that the MCP2515 hardware buffers are drained before they overflow. |
 | NFR-2.1 | Must | The firmware shall be built targeting Cortex-M4 with hardware FPU (`-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard`). |
-| NFR-2.2 | Must | SPI1 shall be configured at ≥ 4 MHz to keep a 14-byte frame SPI transfer below 30 µs. |
+| NFR-2.2 | Must | SPI1 shall be configured at a rate that keeps a 14-byte frame SPI transfer within one CAN frame time at the configured baud rate. At 250 kbit/s (320 µs/frame) and the implemented 703 kHz SPI rate, a 14-byte transfer takes ~159 µs — within budget. |
 | NFR-3.1 | Should | Main loop drain rate at nominal simulation load (six PGN frames per second) shall not cause UART output backpressure on the ring buffer. |
 | NFR-3.2 | Should | UART command response latency shall be < 100 ms from newline receipt. |
 | NFR-4.1 | Should | Firmware shall operate continuously for ≥ 24 hours without crash, hard fault, or dropped frames under nominal simulation load. |
@@ -321,7 +321,7 @@ Drivers/STM32F4xx_HAL_Driver/   — STM32 HAL (from STM32CubeF4 package)
 |---|---|
 | C-1 | MCP2515 VCC must be powered from 3.3V to match STM32 GPIO logic levels. 5V will damage the GPIO pins. |
 | C-2 | A 120 Ω termination resistor must be present at each end of the CAN bus. |
-| C-3 | SPI1 pins PA5/PA6/PA7 must not share the bus with any other SPI device. |
+| C-3 | SPI1 pins PA4/PA5/PA6/PA7 must not share the bus with any other SPI device. |
 | C-4 | PC0 must be the sole EXTI0 source. STM32F4 EXTI lines are per-line number, not per-GPIO port — only one GPIO on EXTI0 can be active at a time. |
 | C-5 | The MCP2515 crystal frequency is assumed to be 8 MHz. CNF register values must be recalculated if a different crystal is fitted. |
 | C-6 | Only one terminal may be connected to the USART3 ST-Link VCP at a time. |
@@ -333,7 +333,7 @@ Drivers/STM32F4xx_HAL_Driver/   — STM32 HAL (from STM32CubeF4 package)
 | # | Type | Description | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|---|
 | R-1 | Technical Risk | MCP2515 CNF values depend on crystal frequency. An unlabelled 16 MHz crystal gives wrong baud rate. | Medium | High | Verify crystal by oscilloscope at power-up or compare sniffer IDs against generator injected IDs; wrong baud produces garbled/absent frames. |
-| R-2 | Technical Risk | ISR SPI read time may exceed back-to-back frame arrival time at burst rate, overflowing MCP2515 hardware buffers before the ISR can drain them. | Low | Medium | MCP2515 holds 2 frames in RXB0+RXB1 (FR-2.4); at 250 kbit/s an 8-byte frame takes ~320 µs; ISR SPI read of 14 bytes at 5.6 MHz takes ~20 µs — well within budget. |
+| R-2 | Technical Risk | ISR SPI read time may exceed back-to-back frame arrival time at burst rate, overflowing MCP2515 hardware buffers before the ISR can drain them. | Low | Medium | MCP2515 holds 2 frames in RXB0+RXB1 (FR-2.4); at 250 kbit/s an 8-byte frame takes ~320 µs; ISR SPI read of 14 bytes at 703 kHz takes ~159 µs — within budget. Increasing SPI prescaler to 16 (5.6 MHz, ~20 µs transfer) is available if headroom is needed. |
 | R-3 | Technical Risk | Main loop UART printing may fall behind ring buffer fill rate under sustained burst load (UART at 115200 baud limits to ~11,520 chars/sec; each output line ~100 chars → ~115 lines/sec, which is less than the burst frame rate). | Medium | Medium | During burst, printed output will lag behind ring buffer fill; ring buffer sized for 256 entries (~82 ms at burst rate). Add a `verbose` on/off flag in Phase 2 to suppress per-frame output during burst. |
 | R-4 | Technical Risk | USART3 ST-Link VCP may not enumerate on all USB cables/hubs. | Low | Low | Use direct USB connection to the workbench machine. |
 | R-5 | Dependency | ESP32-S3 generator (Wish 01b) must be operational to validate end-to-end capture. | — | — | Phase 1 exit criteria are met with a single generator inject frame; full burst test deferred to Phase 2. |
@@ -673,7 +673,7 @@ OK: capture started
 
 ### A.1 STM32 HAL Peripheral Init Sketches
 
-#### SPI1 (Master, CPOL=0/CPHA=0, ~5.6 MHz)
+#### SPI1 (Master, CPOL=0/CPHA=0, ~703 kHz)
 
 ```c
 SPI_HandleTypeDef hspi1 = {
@@ -684,7 +684,7 @@ SPI_HandleTypeDef hspi1 = {
     .Init.CLKPolarity       = SPI_POLARITY_LOW,
     .Init.CLKPhase          = SPI_PHASE_1EDGE,
     .Init.NSS               = SPI_NSS_SOFT,
-    .Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16,  /* 90 MHz / 16 = 5.6 MHz */
+    .Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128, /* 90 MHz / 128 ≈ 703 kHz */
     .Init.FirstBit          = SPI_FIRSTBIT_MSB,
     .Init.TIMode            = SPI_TIMODE_DISABLE,
     .Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE,
@@ -694,7 +694,10 @@ HAL_SPI_Init(&hspi1);
 
 #### EXTI0 (PC0, falling edge, pull-up, priority 1)
 
+NVIC priority is set at init time; EXTI0 is only **enabled** (`HAL_NVIC_EnableIRQ`) when the `start` command is received, and **disabled** on `stop`.
+
 ```c
+/* At init time — configure GPIO and set priority, but do NOT enable IRQ yet */
 GPIO_InitTypeDef g = {
     .Pin  = GPIO_PIN_0,
     .Mode = GPIO_MODE_IT_FALLING,
@@ -702,26 +705,39 @@ GPIO_InitTypeDef g = {
 };
 HAL_GPIO_Init(GPIOC, &g);
 HAL_NVIC_SetPriority(EXTI0_IRQn, 1, 0);
+/* HAL_NVIC_EnableIRQ called later from 'start' command handler */
+
+/* On 'start' command */
 HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+/* On 'stop' command */
+HAL_NVIC_DisableIRQ(EXTI0_IRQn);
 ```
 
 #### EXTI0 IRQ Handler skeleton
 
+The handler clears the pending bit before the SPI read so a second arriving frame does not re-assert the line before the ISR returns.
+
 ```c
 void EXTI0_IRQHandler(void)
 {
-    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
-}
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);
 
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin != GPIO_PIN_0) return;
-    if (g_state != STATE_CAPTURING) return;
+    if (g_state != STATE_CAPTURING)
+        return;
 
     can_rx_frame_t f;
     f.timestamp_ms = HAL_GetTick();
-    mcp2515_read_frame(&s_mcp, &f);   /* reads RXB0 or RXB1 via SPI */
-    ring_buf_write(&g_ring, &f);
+    mcp2515_read_frame(&g_mcp, &f);
+
+    uint32_t next = (g_ring.head + 1) & (RING_BUF_SIZE - 1);
+    if (next != g_ring.tail) {
+        g_ring.buf[g_ring.head] = f;
+        g_ring.head = next;
+        g_frames_captured++;
+    } else {
+        g_frames_dropped++;
+    }
 }
 ```
 
@@ -816,7 +832,7 @@ if (pf < 0xF0) pgn &= 0x3FF00;  /* PDU1: clear PS (destination addr) */
 
 ```
 CAN Bus Sniffer — ready
-STM32 Nucleo F446ZE | MCP2515 CANSTAT=0x80 | 250 kbit/s
+STM32 Nucleo F446ZE | MCP2515 CANSTAT=0x00 | 250 kbit/s
 Type 'help' for commands.
 > start
 OK: capture started
